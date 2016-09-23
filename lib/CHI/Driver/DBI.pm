@@ -31,7 +31,8 @@ has 'db_name'      => ( is => 'rw', isa => 'Str' );
 has 'dbh'          => ( is => 'ro', isa => "$type.DBIHandleGenerator", coerce => 1 );
 has 'dbh_ro'       => ( is => 'ro', isa => "$type.DBIHandleGenerator", predicate => 'has_dbh_ro', coerce => 1 );
 has 'sql_strings'  => ( is => 'rw', isa => 'HashRef', lazy_build => 1 );
-has 'table_prefix' => ( is => 'rw', isa => 'Str', default => 'chi_' );
+has 'table' => ( is => 'rw', isa => 'Str', default => 'chi_cache' );
+has 'key_prefix' => ( is => 'rw', isa => 'Str', builder => '_build_key_prefix', lazy => 1);
 
 __PACKAGE__->meta->make_immutable;
 
@@ -54,7 +55,17 @@ sub BUILD {
 sub _table {
     my ( $self, ) = @_;
 
-    return $self->table_prefix() . $self->namespace();
+    return $self->table();
+}
+
+sub _build_key_prefix {
+    my ( $self ) = @_;
+    return $self->namespace . "::";
+}
+
+sub namespaced_key {
+    my ($self, $key) = @_;
+    return $self->key_prefix . $key;
 }
 
 sub _build_sql_strings {
@@ -63,15 +74,16 @@ sub _build_sql_strings {
     my $dbh   = $self->dbh->();
     my $table = $dbh->quote_identifier( $self->_table );
     my $value = $dbh->quote_identifier('value');
-    my $key   = $dbh->quote_identifier('key');
+    my $key_prefix_match = $dbh->quote_identifier( $self->key_prefix . "%" );
+    my $key   =  $dbh->quote_identifier('key');
 
     my $strings = {
         fetch    => "SELECT $value FROM $table WHERE $key = ?",
         store    => "INSERT INTO $table ( $key, $value ) VALUES ( ?, ? )",
         store2   => "UPDATE $table SET $value = ? WHERE $key = ?",
         remove   => "DELETE FROM $table WHERE $key = ?",
-        clear    => "DELETE FROM $table",
-        get_keys => "SELECT DISTINCT $key FROM $table",
+        clear    => "DELETE FROM $table where $key like $key_prefix_match",
+        get_keys => "SELECT DISTINCT $key FROM $table where $key like $key_prefix_match",
         create   => "CREATE TABLE IF NOT EXISTS $table ("
           . " $key VARCHAR( 300 ), $value TEXT,"
           . " PRIMARY KEY ( $key ) )",
@@ -111,7 +123,7 @@ sub fetch {
     if ( $self->db_name eq 'PostgreSQL' ) {
         $sth->bind_param( 1, undef, { pg_type => DBD::Pg::PG_BYTEA() } );
     }
-    $sth->execute($key) or croak $sth->errstr;
+    $sth->execute($self->namespaced_key($key)) or croak $sth->errstr;
     my $results = $sth->fetchall_arrayref;
 
     return $results->[0]->[0];
@@ -126,7 +138,7 @@ sub store {
         $sth->bind_param( 1, undef, { pg_type => DBD::Pg::PG_BYTEA() } );
         $sth->bind_param( 2, undef, { pg_type => DBD::Pg::PG_BYTEA() } );
     }
-    if ( not $sth->execute( $key, $data ) ) {
+    if ( not $sth->execute( $self->namespaced_key($key), $data ) ) {
         if ( $self->sql_strings->{store2} ) {
             my $sth = $dbh->prepare_cached( $self->sql_strings->{store2} )
               or croak $dbh->errstr;
@@ -136,7 +148,7 @@ sub store {
                 $sth->bind_param( 2, undef,
                     { pg_type => DBD::Pg::PG_BYTEA() } );
             }
-            $sth->execute( $data, $key )
+            $sth->execute( $data, $self->namespaced_key($key) )
               or croak $sth->errstr;
         }
         else {
@@ -157,7 +169,7 @@ sub remove {
     if ( $self->db_name eq 'PostgreSQL' ) {
         $sth->bind_param( 1, undef, { pg_type => DBD::Pg::PG_BYTEA() } );
     }
-    $sth->execute($key) or croak $sth->errstr;
+    $sth->execute($self->namespaced_key($key)) or croak $sth->errstr;
     $sth->finish;
 
     return;
@@ -183,9 +195,15 @@ sub get_keys {
       or croak $dbh->errstr;
     $sth->execute() or croak $sth->errstr;
     my $results = $sth->fetchall_arrayref( [0] );
-    $_ = $_->[0] for @{$results};
 
-    return @{$results};
+    my $key_prefix = $self->key_prefix;
+    my @stripped_results;
+    foreach my $result (@{$results}) {
+        my $stripped = $result->[0];
+        $stripped =~ s/^$key_prefix//g;
+        push @stripped_results, $stripped;
+    }
+    return @stripped_results;
 }
 
 sub get_namespaces { croak 'not supported' }
